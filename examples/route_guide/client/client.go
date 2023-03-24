@@ -29,7 +29,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -120,39 +120,51 @@ func runRouteChat(client pb.RouteGuideClient) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Hour)
 	defer cancel()
-	streamPtr := atomic.Pointer[pb.RouteGuide_RouteChatClient]{}
+	var currentStreamPtr *pb.RouteGuide_RouteChatClient
 	waitc := make(chan struct{})
-	streamc := make(chan *pb.RouteGuide_RouteChatClient, 1)
-	go func() {
-		establishStream := func() pb.RouteGuide_RouteChatClient {
-			stream, err := client.RouteChat(ctx, grpc.WaitForReady(true))
-			if err != nil {
-				log.Fatalf("client.RouteChat failed: %v", err)
-			}
-			fmt.Printf("stream created\n")
-			streamPtr.Store(&stream)
-			streamc <- &stream
-			return stream
+	mu := sync.Mutex{}
+	var streamCancel context.CancelFunc
+
+	getStream := func(resetPrevious bool) pb.RouteGuide_RouteChatClient {
+		mu.Lock()
+		defer mu.Unlock()
+
+		ptr := currentStreamPtr
+		if ptr != nil && !resetPrevious {
+			return *ptr
 		}
 
+		// cancelling earlier requests
+		if streamCancel != nil {
+			streamCancel()
+		}
+
+		var streamCtx context.Context
+		streamCtx, streamCancel = context.WithCancel(ctx)
+
+		// create new stream
+		stream, err := client.RouteChat(streamCtx, grpc.WaitForReady(true))
+		if err != nil {
+			log.Fatalf("client.RouteChat failed: %v", err)
+		}
+		fmt.Printf("Created new stream\n")
+		currentStreamPtr = &stream
+		return stream
+	}
+
+	go func() {
 		for {
-			var stream pb.RouteGuide_RouteChatClient
-			ptr := streamPtr.Load()
-			if ptr == nil {
-				stream = establishStream()
-			} else {
-				stream = *ptr
-			}
+			stream := getStream(false)
 
 			in, err := stream.Recv()
 			if err == io.EOF {
-				// read done.
+				// read done and normal end
 				close(waitc)
 				return
 			}
 			if err != nil {
 				fmt.Printf("Recv: client.RouteChat reading failure: %v. retrying\n", err)
-				streamPtr.Store(nil)
+				getStream(true)
 				continue
 			}
 			log.Printf("Recv: Got message %s at point(%d, %d)", in.Message, in.Location.Latitude, in.Location.Longitude)
@@ -161,18 +173,18 @@ func runRouteChat(client pb.RouteGuideClient) {
 	for i := 0; i < 100; i++ {
 		for _, note := range notes {
 			for {
-				ptr := streamPtr.Load()
-				if ptr == nil {
-					fmt.Printf("Recv: stream go reset. reading from channel\n")
-					ptr = <-streamc
-				}
-				stream := *ptr
+				stream := getStream(false)
 
 				if err := stream.Send(note); err != nil {
+					fmt.Printf("Send: client.RouteChat: stream.Send failed for %v: %v. retrying\n", note, err)
+					// if it is EOF, means stream ended and RecvMsg would give status. see:
+					// https://pkg.go.dev/google.golang.org/grpc#ClientStream (SendMsg)
+					// https://pkg.go.dev/google.golang.org/grpc#ClientConn.NewStream
 					if err == io.EOF {
 						fmt.Printf("Received EOF error\n")
+					} else {
+						getStream(true)
 					}
-					fmt.Printf("Send: client.RouteChat: stream.Send failed for %v: %v. retrying\n", note, err)
 					continue
 				} else {
 					break
@@ -182,7 +194,7 @@ func runRouteChat(client pb.RouteGuideClient) {
 			time.Sleep(1 * time.Second)
 		}
 	}
-	(*streamPtr.Load()).CloseSend()
+	getStream(false).CloseSend()
 	<-waitc
 }
 
