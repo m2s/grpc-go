@@ -122,24 +122,27 @@ func runRouteChat(client pb.RouteGuideClient) {
 	defer cancel()
 	streamPtr := atomic.Pointer[pb.RouteGuide_RouteChatClient]{}
 	waitc := make(chan struct{})
+	streamc := make(chan *pb.RouteGuide_RouteChatClient, 1)
 	go func() {
-		establishStream := func() {
+		establishStream := func() pb.RouteGuide_RouteChatClient {
 			stream, err := client.RouteChat(ctx, grpc.WaitForReady(true))
 			if err != nil {
 				log.Fatalf("client.RouteChat failed: %v", err)
 			}
 			fmt.Printf("stream created\n")
 			streamPtr.Store(&stream)
+			streamc <- &stream
+			return stream
 		}
 
 		for {
+			var stream pb.RouteGuide_RouteChatClient
 			ptr := streamPtr.Load()
 			if ptr == nil {
-				establishStream()
-				ptr = streamPtr.Load()
+				stream = establishStream()
+			} else {
+				stream = *ptr
 			}
-
-			stream := *ptr
 
 			in, err := stream.Recv()
 			if err == io.EOF {
@@ -160,9 +163,8 @@ func runRouteChat(client pb.RouteGuideClient) {
 			for {
 				ptr := streamPtr.Load()
 				if ptr == nil {
-					fmt.Printf("Recv: streaming being initialized. retrying\n")
-					time.Sleep(1 * time.Second)
-					continue
+					fmt.Printf("Recv: stream go reset. reading from channel\n")
+					ptr = <-streamc
 				}
 				stream := *ptr
 
@@ -171,12 +173,12 @@ func runRouteChat(client pb.RouteGuideClient) {
 						fmt.Printf("Received EOF error\n")
 					}
 					fmt.Printf("Send: client.RouteChat: stream.Send failed for %v: %v. retrying\n", note, err)
-					time.Sleep(1 * time.Second)
 					continue
 				} else {
 					break
 				}
 			}
+			// simulating periodic messages being sent
 			time.Sleep(1 * time.Second)
 		}
 	}
