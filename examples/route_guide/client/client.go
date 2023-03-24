@@ -25,9 +25,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -116,15 +118,29 @@ func runRouteChat(client pb.RouteGuideClient) {
 		{Location: &pb.Point{Latitude: 0, Longitude: 2}, Message: "Fifth message"},
 		{Location: &pb.Point{Latitude: 0, Longitude: 3}, Message: "Sixth message"},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Hour)
 	defer cancel()
-	stream, err := client.RouteChat(ctx)
-	if err != nil {
-		log.Fatalf("client.RouteChat failed: %v", err)
-	}
+	streamPtr := atomic.Pointer[pb.RouteGuide_RouteChatClient]{}
 	waitc := make(chan struct{})
 	go func() {
+		establishStream := func() {
+			stream, err := client.RouteChat(ctx, grpc.WaitForReady(true))
+			if err != nil {
+				log.Fatalf("client.RouteChat failed: %v", err)
+			}
+			fmt.Printf("stream created\n")
+			streamPtr.Store(&stream)
+		}
+
 		for {
+			ptr := streamPtr.Load()
+			if ptr == nil {
+				establishStream()
+				ptr = streamPtr.Load()
+			}
+
+			stream := *ptr
+
 			in, err := stream.Recv()
 			if err == io.EOF {
 				// read done.
@@ -132,17 +148,39 @@ func runRouteChat(client pb.RouteGuideClient) {
 				return
 			}
 			if err != nil {
-				log.Fatalf("client.RouteChat failed: %v", err)
+				fmt.Printf("Recv: client.RouteChat reading failure: %v. retrying\n", err)
+				streamPtr.Store(nil)
+				continue
 			}
-			log.Printf("Got message %s at point(%d, %d)", in.Message, in.Location.Latitude, in.Location.Longitude)
+			log.Printf("Recv: Got message %s at point(%d, %d)", in.Message, in.Location.Latitude, in.Location.Longitude)
 		}
 	}()
-	for _, note := range notes {
-		if err := stream.Send(note); err != nil {
-			log.Fatalf("client.RouteChat: stream.Send(%v) failed: %v", note, err)
+	for i := 0; i < 100; i++ {
+		for _, note := range notes {
+			for {
+				ptr := streamPtr.Load()
+				if ptr == nil {
+					fmt.Printf("Recv: streaming being initialized. retrying\n")
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				stream := *ptr
+
+				if err := stream.Send(note); err != nil {
+					if err == io.EOF {
+						fmt.Printf("Received EOF error\n")
+					}
+					fmt.Printf("Send: client.RouteChat: stream.Send failed for %v: %v. retrying\n", note, err)
+					time.Sleep(1 * time.Second)
+					continue
+				} else {
+					break
+				}
+			}
+			time.Sleep(1 * time.Second)
 		}
 	}
-	stream.CloseSend()
+	(*streamPtr.Load()).CloseSend()
 	<-waitc
 }
 
@@ -174,21 +212,6 @@ func main() {
 	}
 	defer conn.Close()
 	client := pb.NewRouteGuideClient(conn)
-
-	// Looking for a valid feature
-	printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906})
-
-	// Feature missing.
-	printFeature(client, &pb.Point{Latitude: 0, Longitude: 0})
-
-	// Looking for features between 40, -75 and 42, -73.
-	printFeatures(client, &pb.Rectangle{
-		Lo: &pb.Point{Latitude: 400000000, Longitude: -750000000},
-		Hi: &pb.Point{Latitude: 420000000, Longitude: -730000000},
-	})
-
-	// RecordRoute
-	runRecordRoute(client)
 
 	// RouteChat
 	runRouteChat(client)
